@@ -1,0 +1,7 @@
+data/
+logs/
+logs_hp/
+
+*.json
+*.pyc
+*.pt
