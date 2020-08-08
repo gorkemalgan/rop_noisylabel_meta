@@ -32,134 +32,81 @@ class torch_dataset(Dataset):
     def __len__(self):
         return len(self.img_paths)
 
-def pre_train(args):
-    def get_dataset_dr():
-        dr_image_dir = os.path.join('data', 'DR')
-        df = pd.read_csv(os.path.join(dr_image_dir, 'trainLabels_cropped.csv'))
-        df['path'] = df['image'].map(lambda x: os.path.join(dr_image_dir,'resized_train_cropped/resized_train_cropped','{}.jpeg'.format(x)))
-        df = df.drop(columns=['image'])
-        df = df.sample(frac=1).reset_index(drop=True) #shuffle dataframe
-        df['level'] = (df['level'] > 1).astype(int) # Disease or no disease
-        #print(df.head(10))
-
-        img_paths, labels = df['path'].tolist(), df['level'].tolist() 
-        x_train, x_val, y_train, y_val = train_test_split(img_paths, labels, test_size=0.2, random_state=RANDOM_SEED)
-
-        train_ds = torch_dataset(x_train, y_train,transform_train)
-        val_ds = torch_dataset(x_val, y_val,transform_val)
-        train_dataloader = torch.utils.data.DataLoader(train_ds,batch_size=BATCH_SIZE,shuffle=False, num_workers=NUM_WORKERS)
-        val_dataloader = torch.utils.data.DataLoader(val_ds,batch_size=BATCH_SIZE,shuffle=False)
-        return train_dataloader, val_dataloader
-
-    optimizer = optim.SGD(net.parameters(), lr=1e-3, momentum=0.9, weight_decay=1e-4)
-    train_dataloader, val_dataloader = get_dataset_dr()
-    NUM_TRAINDATA = len(train_dataloader.dataset)
-
-    for epoch in range(args.stagep):
-        train_accuracy = AverageMeter()
-        train_loss = AverageMeter()
-        for batch_idx, (images, labels) in enumerate(train_dataloader):
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            images, labels = torch.autograd.Variable(images), torch.autograd.Variable(labels)
-
-            output = net(images)
-            _, predicted = torch.max(output.data, 1)
-            loss = criterion_bce(output, labels)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            train_accuracy.update(predicted.eq(labels.data).cpu().sum().item(), labels.size(0)) 
-            train_loss.update(loss.item())
-
-            if VERBOSE == 2:
-                template = "Progress: {:6.5f}, Accuracy: {:5.4f}, Loss: {:5.4f}   \r"
-                sys.stdout.write(template.format(batch_idx*BATCH_SIZE/NUM_TRAINDATA, train_accuracy.percentage, train_loss.avg))
-        if VERBOSE == 2:
-            sys.stdout.flush()  
-
-        val_accuracy, val_loss = evaluate(net, val_dataloader, criterion_cce)
-        if VERBOSE > 0:
-            template = 'Epoch {}, Accuracy(train,val): {:3.1f}/{:3.1f}, Loss(train,val): {:4.3f}/{:4.3f}'
-            print(template.format(epoch + 1, train_accuracy.percentage, val_accuracy,train_loss.avg, val_loss))  
-
-def meta_train(alpha, beta, gamma, stage1, stage2, train_dl, meta_dl, test_dl):
-    print('alpha:{}, beta:{}, gamma:{}, stage1:{}, stage2:{}'.format(alpha, beta, gamma, stage1, stage2))
-
+def normal_train(model_path, epochs, net, train_dl, val_dl, test_dl, epoch_offset=0):
     NUM_TRAINDATA = len(train_dl.dataset)
-    # train with noisy labels
-    net.fc = nn.Linear(2048,NUM_CLASSES) 
-    net.to(DEVICE)
-    net.train()
     optimizer = optim.SGD(net.parameters(), lr=1e-3, momentum=0.9, weight_decay=1e-4)
+    if not os.path.exists(model_path):
+        for epoch in range(epochs): 
+            start_epoch = time.time()
+            train_accuracy = AverageMeter()
+            train_loss = AverageMeter()
 
-    def warmup_training(model_s1_path):
-        if not os.path.exists(model_s1_path):
-            for epoch in range(stage1): 
-                start_epoch = time.time()
-                train_accuracy = AverageMeter()
-                train_loss = AverageMeter()
+            lr = lr_scheduler(epoch)
+            set_learningrate(optimizer, lr)
+            net.train()
 
-                lr = lr_scheduler(epoch)
-                set_learningrate(optimizer, lr)
-                net.train()
+            for batch_idx, (images, labels) in enumerate(train_dl):
+                start = time.time()
+                
+                # training images and labels
+                images, labels = images.to(DEVICE), labels.to(DEVICE)
+                images, labels = torch.autograd.Variable(images), torch.autograd.Variable(labels)
 
-                for batch_idx, (images, labels) in enumerate(train_dl):
-                    start = time.time()
-                    
-                    # training images and labels
-                    images, labels = images.to(DEVICE), labels.to(DEVICE)
-                    images, labels = torch.autograd.Variable(images), torch.autograd.Variable(labels)
+                # compute output
+                output, _feats = net(images,get_feat=True)
+                _, predicted = torch.max(output.data, 1)
 
-                    # compute output
-                    output, _feats = net(images,get_feat=True)
-                    _, predicted = torch.max(output.data, 1)
+                # training
+                loss = criterion_cce(output, labels)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
-                    # training
-                    loss = criterion_cce(output, labels)
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-
-                    train_accuracy.update(predicted.eq(labels.data).cpu().sum().item(), labels.size(0)) 
-                    train_loss.update(loss.item())
-                    
-                    if VERBOSE == 2:
-                        template = "Progress: {:6.5f}, Accuracy: {:5.4f}, Loss: {:5.4f}, Process time:{:5.4f}   \r"
-                        sys.stdout.write(template.format(batch_idx*BATCH_SIZE/NUM_TRAINDATA, train_accuracy.percentage, train_loss.avg, time.time()-start))
+                train_accuracy.update(predicted.eq(labels.data).cpu().sum().item(), labels.size(0)) 
+                train_loss.update(loss.item())
+                
                 if VERBOSE == 2:
-                    sys.stdout.flush()  
-                    
-                # evaluate on validation and test data
-                val_accuracy, val_loss = evaluate(net, meta_dl, criterion_cce)
-                test_accuracy, test_loss = evaluate(net, test_dl, criterion_cce)
-
-                if SAVE_LOGS == 1:
-                    summary_writer.add_scalar('train_loss', train_loss.avg, epoch)
-                    summary_writer.add_scalar('test_loss', test_loss, epoch)
-                    summary_writer.add_scalar('test_accuracy', test_accuracy, epoch)
-                    summary_writer.add_scalar('val_loss', val_loss, epoch)
-                    summary_writer.add_scalar('val_accuracy', val_accuracy, epoch)
-
-                if VERBOSE > 0:
-                    template = 'Epoch {}, Accuracy(train,val,test): {:3.1f}/{:3.1f}/{:3.1f}, Loss(train,val,test): {:4.3f}/{:4.3f}/{:4.3f},Learning rate: {}, Time: {:3.1f}({:3.2f})'
-                    print(template.format(epoch + 1, 
-                                        train_accuracy.percentage, val_accuracy, test_accuracy,
-                                        train_loss.avg, val_loss, test_loss,  
-                                        lr, time.time()-start_epoch, (time.time()-start_epoch)/3600))   
-            torch.save(net.cpu().state_dict(), model_s1_path)
-            net.to(DEVICE) 
-        else:
-            net.load_state_dict(torch.load(model_s1_path, map_location=DEVICE))  
+                    template = "Progress: {:6.5f}, Accuracy: {:5.4f}, Loss: {:5.4f}, Process time:{:5.4f}   \r"
+                    sys.stdout.write(template.format(batch_idx*BATCH_SIZE/NUM_TRAINDATA, train_accuracy.percentage, train_loss.avg, time.time()-start))
+            if VERBOSE == 2:
+                sys.stdout.flush()  
+                
+            # evaluate on validation and test data
             val_accuracy, val_loss = evaluate(net, meta_dl, criterion_cce)
             test_accuracy, test_loss = evaluate(net, test_dl, criterion_cce)
-            if VERBOSE > 0:
-                print('Pretrained model, Accuracy(val,test): {:3.1f}/{:3.1f}, Loss(val,test): {:4.3f}/{:4.3f}'.format(val_accuracy, test_accuracy,val_loss, test_loss))
+
             if SAVE_LOGS == 1:
-                summary_writer.add_scalar('test_loss', test_loss, stage1-1)
-                summary_writer.add_scalar('test_accuracy', test_accuracy, stage1-1)
-                summary_writer.add_scalar('val_loss', val_loss, stage1-1)
-                summary_writer.add_scalar('val_accuracy', val_accuracy, stage1-1)
+                summary_writer.add_scalar('train_loss', train_loss.avg, epoch)
+                summary_writer.add_scalar('test_loss', test_loss, epoch)
+                summary_writer.add_scalar('test_accuracy', test_accuracy, epoch)
+                summary_writer.add_scalar('val_loss', val_loss, epoch)
+                summary_writer.add_scalar('val_accuracy', val_accuracy, epoch)
+
+            if VERBOSE > 0:
+                template = 'Epoch {}, Accuracy(train,val,test): {:3.1f}/{:3.1f}/{:3.1f}, Loss(train,val,test): {:4.3f}/{:4.3f}/{:4.3f},Learning rate: {}, Time: {:3.1f}({:3.2f})'
+                print(template.format(epoch + 1, 
+                                    train_accuracy.percentage, val_accuracy, test_accuracy,
+                                    train_loss.avg, val_loss, test_loss,  
+                                    lr, time.time()-start_epoch, (time.time()-start_epoch)/3600))   
+        torch.save(net.cpu().state_dict(), model_path)
+        net.to(DEVICE) 
+    else:
+        net.load_state_dict(torch.load(model_path, map_location=DEVICE))  
+        val_accuracy, val_loss = evaluate(net, meta_dl, criterion_cce)
+        test_accuracy, test_loss = evaluate(net, test_dl, criterion_cce)
+        if VERBOSE > 0:
+            print('Pretrained model, Accuracy(val,test): {:3.1f}/{:3.1f}, Loss(val,test): {:4.3f}/{:4.3f}'.format(val_accuracy, test_accuracy,val_loss, test_loss))
+        if SAVE_LOGS == 1:
+            summary_writer.add_scalar('test_loss', test_loss, epochs+epoch_offset-1)
+            summary_writer.add_scalar('test_accuracy', test_accuracy, epochs+epoch_offset-1)
+            summary_writer.add_scalar('val_loss', val_loss, epochs+epoch_offset-1)
+            summary_writer.add_scalar('val_accuracy', val_accuracy, epochs+epoch_offset-1)
+
+def meta_train(alpha, beta, gamma, epochs, net, feature_encoder, train_dl, meta_dl, test_dl, epoch_offset=0):
+    print('alpha:{}, beta:{}, gamma:{}, epochs:{}'.format(alpha, beta, gamma, epochs))
+
+    NUM_TRAINDATA = len(train_dl.dataset)
+    optimizer = optim.SGD(net.parameters(), lr=1e-3, momentum=0.9, weight_decay=1e-4)
 
     def meta_training_loop(meta_epoch, index, output, labels, yy, images_meta, labels_meta, feats):
         meta_net.train()
@@ -207,13 +154,13 @@ def meta_train(alpha, beta, gamma, stage1, stage2, train_dl, meta_dl, test_dl):
         test_acc_best = 0
         val_acc_best = 0
         epoch_best = 0
-        for epoch in range(stage1,stage2): 
+        for epoch in range(epochs): 
             start_epoch = time.time()
             train_accuracy = AverageMeter()
             train_loss = AverageMeter()
             train_accuracy_meta = AverageMeter()
             label_similarity = AverageMeter()
-            meta_epoch = epoch - stage1
+            meta_epoch = epoch
 
             lr = lr_scheduler(epoch)
             set_learningrate(optimizer, lr)
@@ -279,17 +226,17 @@ def meta_train(alpha, beta, gamma, stage1, stage2, train_dl, meta_dl, test_dl):
                 epoch_best = epoch
 
             if SAVE_LOGS == 1:
-                summary_writer.add_scalar('train_loss', train_loss.avg, epoch)
-                summary_writer.add_scalar('test_loss', test_loss, epoch)
-                summary_writer.add_scalar('train_accuracy', train_accuracy.percentage, epoch)
-                summary_writer.add_scalar('test_accuracy', test_accuracy, epoch)
-                summary_writer.add_scalar('test_accuracy_best', test_acc_best, epoch)
-                summary_writer.add_scalar('val_loss', val_loss, epoch)
-                summary_writer.add_scalar('val_accuracy', val_accuracy, epoch)
-                summary_writer.add_scalar('val_accuracy_best', val_acc_best, epoch)
-                summary_writer.add_scalar('label_similarity', label_similarity.percentage, epoch)
+                summary_writer.add_scalar('train_loss', train_loss.avg, epoch+epoch_offset)
+                summary_writer.add_scalar('test_loss', test_loss, epoch+epoch_offset)
+                summary_writer.add_scalar('train_accuracy', train_accuracy.percentage, epoch+epoch_offset)
+                summary_writer.add_scalar('test_accuracy', test_accuracy, epoch+epoch_offset)
+                summary_writer.add_scalar('test_accuracy_best', test_acc_best, epoch+epoch_offset)
+                summary_writer.add_scalar('val_loss', val_loss, epoch+epoch_offset)
+                summary_writer.add_scalar('val_accuracy', val_accuracy, epoch+epoch_offset)
+                summary_writer.add_scalar('val_accuracy_best', val_acc_best, epoch+epoch_offset)
+                summary_writer.add_scalar('label_similarity', label_similarity.percentage, epoch+epoch_offset)
                 for tag, parm in meta_net.named_parameters():
-                    summary_writer.add_histogram('grads_'+tag, grads_dict[tag], epoch)
+                    summary_writer.add_histogram('grads_'+tag, grads_dict[tag], epoch+epoch_offset)
 
             if VERBOSE > 0:
                 template = 'Epoch {}, Accuracy(train,meta_train,val,test): {:3.1f}/{:3.1f}/{:3.1f}/{:3.1f}, Loss(train,val,test): {:4.3f}/{:4.3f}/{:4.3f}, Label similarity: {:6.3f}, Hyper-params(alpha,beta,gamma): {:3.2f}/{:5.4f}/{:3.2f}, Time: {:3.1f}({:3.2f})'
@@ -306,40 +253,30 @@ def meta_train(alpha, beta, gamma, stage1, stage2, train_dl, meta_dl, test_dl):
             torch.save(net.state_dict(), os.path.join(log_dir, 'saved_model.pt'))
         return val_acc_best, test_acc_best, epoch_best
 
-    def init_labels(y_init_path):
+    def init_labels():
         new_y = np.zeros([NUM_META_EPOCHS+1,NUM_TRAINDATA,NUM_CLASSES])
-        if not os.path.exists(y_init_path) or (USE_SAVED == 0):
-            y_init = np.zeros([NUM_TRAINDATA,NUM_CLASSES])
-            for batch_idx, (_, labels) in enumerate(train_dl):
-                index = np.arange(batch_idx*BATCH_SIZE, (batch_idx)*BATCH_SIZE+labels.size(0))
-                onehot = torch.zeros(labels.size(0), NUM_CLASSES).scatter_(1, labels.view(-1, 1), 1).cpu().numpy()
-                y_init[index, :] = onehot
-            if not os.path.exists(y_init_path) or (USE_SAVED == 0):
-                np.save(y_init_path,y_init)
-        new_y[0] = np.load(y_init_path)
+        y_init = np.zeros([NUM_TRAINDATA,NUM_CLASSES])
+        for batch_idx, (_, labels) in enumerate(train_dl):
+            index = np.arange(batch_idx*BATCH_SIZE, (batch_idx)*BATCH_SIZE+labels.size(0))
+            onehot = torch.zeros(labels.size(0), NUM_CLASSES).scatter_(1, labels.view(-1, 1), 1).cpu().numpy()
+            y_init[index, :] = onehot
+        new_y[0] = y_init
         return new_y
 
-    def extract_features(features_path,losses_path):
-        if not os.path.exists(features_path) or not os.path.exists(losses_path) or not os.path.exists(outs_path) or (USE_SAVED == 0):
-            features = np.zeros((NUM_TRAINDATA,NUM_FEATURES))
-            outs = np.zeros((NUM_TRAINDATA,NUM_CLASSES))
-            losses = np.zeros(NUM_TRAINDATA)
-            c = nn.CrossEntropyLoss(reduction='none').to(DEVICE)
-            for batch_idx, (images, labels) in enumerate(train_dl):
-                images, labels = images.to(DEVICE), labels.to(DEVICE)
-                index = np.arange(batch_idx*BATCH_SIZE, (batch_idx)*BATCH_SIZE+labels.size(0))
-                output, feats = feature_encoder(images,get_feat=True)
-                features[index] = feats.cpu().detach().numpy()
-                outs[index] = output.cpu().detach().numpy()
-                loss = c(output, labels)
-                losses[index] = loss.detach().cpu().numpy()
-            if not os.path.exists(features_path) or (USE_SAVED == 0):
-                np.save(features_path,features)
-            if not os.path.exists(losses_path) or (USE_SAVED == 0):
-                np.save(losses_path,losses)
-            if not os.path.exists(outs_path) or (USE_SAVED == 0):
-                np.save(outs_path,outs)
-        return np.load(features_path), np.load(losses_path), np.load(outs_path)
+    def extract_features():
+        features = np.zeros((NUM_TRAINDATA,NUM_FEATURES))
+        outs = np.zeros((NUM_TRAINDATA,NUM_CLASSES))
+        losses = np.zeros(NUM_TRAINDATA)
+        c = nn.CrossEntropyLoss(reduction='none').to(DEVICE)
+        for batch_idx, (images, labels) in enumerate(train_dl):
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            index = np.arange(batch_idx*BATCH_SIZE, (batch_idx)*BATCH_SIZE+labels.size(0))
+            output, feats = feature_encoder(images,get_feat=True)
+            features[index] = feats.cpu().detach().numpy()
+            outs[index] = output.cpu().detach().numpy()
+            loss = c(output, labels)
+            losses[index] = loss.detach().cpu().numpy()
+        return features, losses, outs
 
     class MetaNet(nn.Module):
         def __init__(self, input, output):
@@ -360,23 +297,10 @@ def meta_train(alpha, beta, gamma, stage1, stage2, train_dl, meta_dl, test_dl):
     optimizer_meta_net = torch.optim.Adam(meta_net.parameters(), beta, weight_decay=1e-4)
     meta_net.train()
 
-    # paths for save and load
-    path_ext = '{}_{}_{}'.format(NUM_TRAINDATA,RANDOM_SEED,stage1)
-    model_s1_path = 'logs/model_s1_{}.pt'.format(path_ext)
-    y_init_path = 'logs/yinit_{}.npy'.format(path_ext)
-    features_path = 'logs/features_{}.npy'.format(path_ext)
-    outs_path = 'logs/outs_{}.npy'.format(path_ext)
-    losses_path = 'logs/losses_{}.npy'.format(path_ext)
-
-    # if not done beforehand, perform warmup-training
-    warmup_training(model_s1_path)
-    # set feature encoder as model trained after warm-up
-    feature_encoder.load_state_dict(torch.load(model_s1_path, map_location=DEVICE))  
-    feature_encoder.eval()
     # initialize predicted labels with given labels
-    new_y = init_labels(y_init_path)
+    new_y = init_labels()
     # extract features for all training data
-    features, _, _ = extract_features(features_path,losses_path) 
+    features, _, _ = extract_features() 
 
     # meta training
     return meta_training()
@@ -416,6 +340,24 @@ def evaluate(net, dataloader, criterion):
             eval_accuracy.update(predicted.eq(targets.data).cpu().sum().item(), targets.size(0)) 
             eval_loss.update(loss.item())
     return eval_accuracy.percentage, eval_loss.avg
+
+def get_dataset_dr():
+    dr_image_dir = os.path.join('data', 'DR')
+    df = pd.read_csv(os.path.join(dr_image_dir, 'trainLabels_cropped.csv'))
+    df['path'] = df['image'].map(lambda x: os.path.join(dr_image_dir,'resized_train_cropped/resized_train_cropped','{}.jpeg'.format(x)))
+    df = df.drop(columns=['image'])
+    df = df.sample(frac=1).reset_index(drop=True) #shuffle dataframe
+    df['level'] = (df['level'] > 1).astype(int) # Disease or no disease
+    #print(df.head(10))
+
+    img_paths, labels = df['path'].tolist(), df['level'].tolist() 
+    x_train, x_val, y_train, y_val = train_test_split(img_paths, labels, test_size=0.2, random_state=RANDOM_SEED)
+
+    train_ds = torch_dataset(x_train, y_train,transform_train)
+    val_ds = torch_dataset(x_val, y_val,transform_val)
+    train_dataloader = torch.utils.data.DataLoader(train_ds,batch_size=BATCH_SIZE,shuffle=False, num_workers=NUM_WORKERS)
+    val_dataloader = torch.utils.data.DataLoader(val_ds,batch_size=BATCH_SIZE,shuffle=False)
+    return train_dataloader, val_dataloader
 
 def read_dataset_rop():         
     dr_image_dir = os.path.join('data', 'ROP')
@@ -511,8 +453,8 @@ if __name__ == "__main__":
         help="Epoch num to end stage1 (straight training)")
     parser.add_argument('-s2', '--stage2', required=False, type=int, default=10,
         help="Epoch num to end stage2 (meta training)")
-    parser.add_argument('-sp', '--stagep', required=False, type=int, default=1,
-        help="Epoch num for pre-training")
+    parser.add_argument('-s3', '--stage3', required=False, type=int, default=1,
+        help="")
 
     parser.add_argument('-m', '--metadata_num', required=False, type=int, default=200,
         help="Number of samples to be used as meta-data")
@@ -575,12 +517,13 @@ if __name__ == "__main__":
         create_folder(log_dir_hp)
         hp_writer = SummaryWriter(log_dir_hp)
 
-    # get datasets
+    # get diabetic retinopathy dataset
+    train_dl_dr, val_dl_dr = get_dataset_dr()
+    # get rop dataset
     img_paths, labels_saban, labels_berker, labels_banu = read_dataset_rop()
     idx_train, idx_meta, idx_test = split_train_meta_test(labels_saban, labels_berker, labels_banu)
     x_train, x_meta, y_meta, x_test, y_test = img_paths[idx_train], img_paths[idx_meta], labels_saban[idx_meta], img_paths[idx_test], labels_saban[idx_test]
     y_train = get_dataset_labels(labels_saban[idx_train], labels_berker[idx_train], labels_banu[idx_train], args.labeler)
-
     train_ds = torch_dataset(x_train, y_train,transform_train)
     meta_ds  = torch_dataset(x_meta, y_meta,transform_val)
     test_ds  = torch_dataset(x_test, y_test,transform_val)
@@ -598,16 +541,37 @@ if __name__ == "__main__":
     start_train = time.time()
     print("Device: {}/{}, Batch size: {}, Num-MetaData: {}, Seed: {}".format(DEVICE, GPU_ID, BATCH_SIZE, args.metadata_num, RANDOM_SEED))
 
+    model_s1_path = "models1_dr_{}_{}".format(args.stage1,RANDOM_SEED)
+    model_s2_path = "models2_dr_{}_{}_{}".format(args.stage1, args.stage2,RANDOM_SEED)
+
     # pre-train solely on diabetic retinopathy data
-    pre_train(args)
-    # meta-train on dr with rop as meta data
-    val_acc_best_p, test_acc_best_p, epoch_best_p = meta_train(args.alpha, args.beta, args.gamma, args.stage1, args.stage2, train_dl, meta_dl, test_dl)
-    # meta-train on rop
-    val_acc_best, test_acc_best, epoch_best = meta_train(args.alpha, args.beta, args.gamma, args.stage1, args.stage2, train_dl, meta_dl, test_dl)
+    normal_train(model_s1_path, args.stage1, net, train_dl_dr, val_dl_dr, val_dl_dr)
+    # change the last layer for rop dataset and freeze last of the layers for learning
+    # on rop dataset, we only train fc layers
+    net.fc = nn.Linear(2048,NUM_CLASSES) 
+    net.to(DEVICE)
+    for param in net.parameters():
+        param.requires_grad = False 
+    for param in net.fc.parameters():
+        param.requires_grad = True
+    net.train()
+
+    # train solely on rop with noisy labels
+    if args.stage2 > 0:
+        model_s2_path = "models2_dr_{}_{}_{}".format(args.stage1, args.stage2,RANDOM_SEED)
+        normal_train(model_s2_path, args.stage2, net, train_dl, meta_dl, test_dl, epoch_offset=args.stage1)
+    else:
+        model_s2_path = model_s1_path
+        
+    # meta-train
+    feature_encoder.load_state_dict(torch.load(model_s2_path, map_location=DEVICE))  
+    feature_encoder.eval()
+    val_acc_best, test_acc_best, epoch_best = meta_train(args.alpha, args.beta, args.gamma, args.stage3, net, feature_encoder, train_dl, meta_dl, test_dl, epoch_offset=args.stage1+args.stage2)
 
     if SAVE_LOGS:
+        NUM_TRAINDATA = len(train_dl.dataset)
         # write log for hyperparameters
-        hp_writer.add_hparams({'alpha':args.alpha, 'beta': args.beta, 'gamma':args.gamma, 'stage1':args.stage1, 'stage2':args.stage2, 'num_meta':args.metadata_num, 'num_train': NUM_TRAINDATA}, 
+        hp_writer.add_hparams({'alpha':args.alpha, 'beta': args.beta, 'gamma':args.gamma, 'stage1':args.stage1, 'stage2':args.stage2, 'stage2':args.stage3, 'num_meta':args.metadata_num, 'num_train': NUM_TRAINDATA}, 
                                 {'val_accuracy': val_acc_best, 'test_accuracy': test_acc_best, 'epoch_best':epoch_best})
         hp_writer.close()
     print('Total training duration: {:3.2f}h'.format((time.time()-start_train)/3600))
