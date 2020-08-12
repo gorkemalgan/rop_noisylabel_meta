@@ -32,75 +32,61 @@ class torch_dataset(Dataset):
     def __len__(self):
         return len(self.img_paths)
 
-def normal_train(model_path, epochs, net, train_dl, val_dl, test_dl, epoch_offset=0):
+def normal_train(epochs, net, train_dl, val_dl, test_dl, epoch_offset=0):
     NUM_TRAINDATA = len(train_dl.dataset)
     optimizer = optim.SGD(net.parameters(), lr=1e-3, momentum=0.9, weight_decay=1e-4)
-    if not os.path.exists(model_path):
-        for epoch in range(epochs): 
-            start_epoch = time.time()
-            train_accuracy = AverageMeter()
-            train_loss = AverageMeter()
+    for epoch in range(epochs): 
+        start_epoch = time.time()
+        train_accuracy = AverageMeter()
+        train_loss = AverageMeter()
 
-            lr = lr_scheduler(epoch)
-            set_learningrate(optimizer, lr)
-            net.train()
+        lr = lr_scheduler(epoch)
+        set_learningrate(optimizer, lr)
+        net.train()
 
-            for batch_idx, (images, labels) in enumerate(train_dl):
-                start = time.time()
-                
-                # training images and labels
-                images, labels = images.to(DEVICE), labels.to(DEVICE)
-                images, labels = torch.autograd.Variable(images), torch.autograd.Variable(labels)
+        for batch_idx, (images, labels) in enumerate(train_dl):
+            start = time.time()
+            
+            # training images and labels
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            images, labels = torch.autograd.Variable(images), torch.autograd.Variable(labels)
 
-                # compute output
-                output, _feats = net(images,get_feat=True)
-                _, predicted = torch.max(output.data, 1)
+            # compute output
+            output, _feats = net(images,get_feat=True)
+            _, predicted = torch.max(output.data, 1)
 
-                # training
-                loss = criterion_cce(output, labels)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+            # training
+            loss = criterion_cce(output, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-                train_accuracy.update(predicted.eq(labels.data).cpu().sum().item(), labels.size(0)) 
-                train_loss.update(loss.item())
-                
-                if VERBOSE == 2:
-                    template = "Progress: {:6.5f}, Accuracy: {:5.4f}, Loss: {:5.4f}, Process time:{:5.4f}   \r"
-                    sys.stdout.write(template.format(batch_idx*BATCH_SIZE/NUM_TRAINDATA, train_accuracy.percentage, train_loss.avg, time.time()-start))
+            train_accuracy.update(predicted.eq(labels.data).cpu().sum().item(), labels.size(0)) 
+            train_loss.update(loss.item())
+            
             if VERBOSE == 2:
-                sys.stdout.flush()  
-                
-            # evaluate on validation and test data
-            val_accuracy, val_loss = evaluate(net, meta_dl, criterion_cce)
-            test_accuracy, test_loss = evaluate(net, test_dl, criterion_cce)
-
-            if SAVE_LOGS == 1:
-                summary_writer.add_scalar('train_loss', train_loss.avg, epoch)
-                summary_writer.add_scalar('test_loss', test_loss, epoch)
-                summary_writer.add_scalar('test_accuracy', test_accuracy, epoch)
-                summary_writer.add_scalar('val_loss', val_loss, epoch)
-                summary_writer.add_scalar('val_accuracy', val_accuracy, epoch)
-
-            if VERBOSE > 0:
-                template = 'Epoch {}, Accuracy(train,val,test): {:3.1f}/{:3.1f}/{:3.1f}, Loss(train,val,test): {:4.3f}/{:4.3f}/{:4.3f},Learning rate: {}, Time: {:3.1f}({:3.2f})'
-                print(template.format(epoch + 1, 
-                                    train_accuracy.percentage, val_accuracy, test_accuracy,
-                                    train_loss.avg, val_loss, test_loss,  
-                                    lr, time.time()-start_epoch, (time.time()-start_epoch)/3600))   
-        torch.save(net.cpu().state_dict(), model_path)
-        net.to(DEVICE) 
-    else:
-        net.load_state_dict(torch.load(model_path, map_location=DEVICE))  
-        val_accuracy, val_loss = evaluate(net, meta_dl, criterion_cce)
+                template = "Progress: {:6.5f}, Accuracy: {:5.4f}, Loss: {:5.4f}, Process time:{:5.4f}   \r"
+                sys.stdout.write(template.format(batch_idx*BATCH_SIZE/NUM_TRAINDATA, train_accuracy.percentage, train_loss.avg, time.time()-start))
+        if VERBOSE == 2:
+            sys.stdout.flush()  
+            
+        # evaluate on validation and test data
+        val_accuracy, val_loss = evaluate(net, val_dl, criterion_cce)
         test_accuracy, test_loss = evaluate(net, test_dl, criterion_cce)
-        if VERBOSE > 0:
-            print('Pretrained model, Accuracy(val,test): {:3.1f}/{:3.1f}, Loss(val,test): {:4.3f}/{:4.3f}'.format(val_accuracy, test_accuracy,val_loss, test_loss))
+
         if SAVE_LOGS == 1:
-            summary_writer.add_scalar('test_loss', test_loss, epochs+epoch_offset-1)
-            summary_writer.add_scalar('test_accuracy', test_accuracy, epochs+epoch_offset-1)
-            summary_writer.add_scalar('val_loss', val_loss, epochs+epoch_offset-1)
-            summary_writer.add_scalar('val_accuracy', val_accuracy, epochs+epoch_offset-1)
+            summary_writer.add_scalar('train_loss', train_loss.avg, epoch)
+            summary_writer.add_scalar('test_loss', test_loss, epoch)
+            summary_writer.add_scalar('test_accuracy', test_accuracy, epoch)
+            summary_writer.add_scalar('val_loss', val_loss, epoch)
+            summary_writer.add_scalar('val_accuracy', val_accuracy, epoch)
+
+        if VERBOSE > 0:
+            template = 'Epoch {}, Accuracy(train,val,test): {:3.1f}/{:3.1f}/{:3.1f}, Loss(train,val,test): {:4.3f}/{:4.3f}/{:4.3f},Learning rate: {}, Time: {:3.1f}({:3.2f})'
+            print(template.format(epoch + 1, 
+                                train_accuracy.percentage, val_accuracy, test_accuracy,
+                                train_loss.avg, val_loss, test_loss,  
+                                lr, time.time()-start_epoch, (time.time()-start_epoch)/3600))   
 
 def meta_train(alpha, beta, gamma, epochs, net, feature_encoder, train_dl, meta_dl, test_dl, epoch_offset=0):
     print('alpha:{}, beta:{}, gamma:{}, epochs:{}'.format(alpha, beta, gamma, epochs))
@@ -311,7 +297,7 @@ def get_model(num_classes):
     except:
         model = resnet50(pretrained=False)
         model.load_state_dict(torch.load('resnet50.pt'))
-    model.fc = nn.Linear(2048,2)
+    model.fc = nn.Linear(2048,num_classes)
     model.to(DEVICE)
     model.train()
     return model
@@ -356,13 +342,13 @@ def get_dataset_dr():
     train_ds = torch_dataset(x_train, y_train,transform_train)
     val_ds = torch_dataset(x_val, y_val,transform_val)
     train_dataloader = torch.utils.data.DataLoader(train_ds,batch_size=BATCH_SIZE,shuffle=False, num_workers=NUM_WORKERS)
-    val_dataloader = torch.utils.data.DataLoader(val_ds,batch_size=BATCH_SIZE,shuffle=False)
+    val_dataloader = torch.utils.data.DataLoader(val_ds,batch_size=BATCH_SIZE,shuffle=False, num_workers=NUM_WORKERS)
     return train_dataloader, val_dataloader
 
 def read_dataset_rop():         
     dr_image_dir = os.path.join('data', 'ROP')
     df = pd.read_csv(os.path.join(dr_image_dir, 'images.csv'))
-    df['path'] = df['image'].map(lambda x: os.path.join(dr_image_dir,'ROP-All2-imgs','{}.jpeg'.format(x)))
+    df['path'] = df['image'].map(lambda x: os.path.join(dr_image_dir,'ROP-All2-imgs','{}.jpg'.format(x)))
     df = df.drop(columns=['image'])
     #df = df.sample(frac=1).reset_index(drop=True) #shuffle dataframe
     img_paths, labels_saban, labels_berker, labels_banu = np.array(df['path'].tolist()), np.array(df['saban'].tolist()), np.array(df['berker'].tolist()), np.array(df['banu'].tolist())
@@ -370,15 +356,15 @@ def read_dataset_rop():
     # correction for berker
     labels_berker[labels_berker=='nan'] = labels_saban[labels_berker=='nan']
 
-    labels_saban[labels_saban=='normal'] = 0
-    labels_saban[labels_saban=='preplus'] = 1
-    labels_saban[labels_saban=='plus'] = 2
-    labels_berker[labels_berker=='normal'] = 0
-    labels_berker[labels_berker=='preplus'] = 1
-    labels_berker[labels_berker=='plus'] = 2
-    labels_banu[labels_banu=='normal'] = 0
-    labels_banu[labels_banu=='preplus'] = 1
-    labels_banu[labels_banu=='plus'] = 2
+    labels_saban[labels_saban=='normal'] = int(0)
+    labels_saban[labels_saban=='preplus'] = int(1)
+    labels_saban[labels_saban=='plus'] = int(2)
+    labels_berker[labels_berker=='normal'] = int(0)
+    labels_berker[labels_berker=='preplus'] = int(1)
+    labels_berker[labels_berker=='plus'] = int(2)
+    labels_banu[labels_banu=='normal'] = int(0)
+    labels_banu[labels_banu=='preplus'] = int(1)
+    labels_banu[labels_banu=='plus'] = int(2)
 
     return img_paths, labels_saban.astype(int), labels_berker.astype(int), labels_banu.astype(int)
 
@@ -422,6 +408,18 @@ def get_dataset_labels(labels_saban, labels_berker, labels_banu, algorithm):
     else:
         assert True , 'wrong labeling algorithm!'
 
+def freeze_model():
+    for param in net.parameters():
+        param.requires_grad = False 
+    for param in net.fc.parameters():
+        param.requires_grad = True
+    net.train()
+
+def unfreeze_model():
+    for param in net.parameters():
+        param.requires_grad = True 
+    net.train()
+
 if __name__ == "__main__":
     import argparse
 
@@ -443,24 +441,24 @@ if __name__ == "__main__":
     parser.add_argument('--seed', required=False, type=int, default=42,
         help="Random seed to be used in simulation")
     
-    parser.add_argument('-a', '--alpha', required=False, type=float,
+    parser.add_argument('-a', '--alpha', required=False, type=float, default=0.5,
         help="Learning rate for meta iteration")
-    parser.add_argument('-b', '--beta', required=False, type=float,
+    parser.add_argument('-b', '--beta', required=False, type=float, default=1e-3,
         help="Beta paramter")
-    parser.add_argument('-g', '--gamma', required=False, type=float,
+    parser.add_argument('-g', '--gamma', required=False, type=float, default=0.1,
         help="Gamma paramter")
     parser.add_argument('-s1', '--stage1', required=False, type=int, default=1,
         help="Epoch num to end stage1 (straight training)")
-    parser.add_argument('-s2', '--stage2', required=False, type=int, default=10,
+    parser.add_argument('-s2', '--stage2', required=False, type=int, default=1,
         help="Epoch num to end stage2 (meta training)")
-    parser.add_argument('-s3', '--stage3', required=False, type=int, default=1,
+    parser.add_argument('-s3', '--stage3', required=False, type=int, default=10,
         help="")
 
     parser.add_argument('-m', '--metadata_num', required=False, type=int, default=200,
         help="Number of samples to be used as meta-data")
     parser.add_argument('-t', '--testdata_num', required=False, type=int, default=200,
         help="Number of samples to be used as meta-data")
-    parser.add_argument('-l', '--labeler', required=False, type=str, default='soft',
+    parser.add_argument('-l', '--labeler', required=False, type=str, default='mv',
         help="saban, berker, banu, mv, soft")
 
     args = parser.parse_args()
@@ -475,23 +473,26 @@ if __name__ == "__main__":
     NUM_TESTDATA = 100
     
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    IMG_RESIZED = (640,480)
+    IMG_RESIZED = 256#(640,480)
+    IMG_CROPPED = 224
     NUM_CLASSES = 3
     NUM_FEATURES = 2048
-    NUM_META_EPOCHS = args.stage2 - args.stage1
+    NUM_META_EPOCHS = args.stage3
 
     torch.manual_seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
     torch.backends.cudnn.benchmark = True
 
     transform_train = transforms.Compose([
-        transforms.Resize(IMG_RESIZED),
+        transforms.Resize((IMG_RESIZED,IMG_RESIZED)),
+        transforms.CenterCrop((IMG_CROPPED,IMG_CROPPED)),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406),(0.229, 0.224, 0.225))
     ]) 
 
     transform_val = transforms.Compose([
-        transforms.Resize(IMG_RESIZED),
+        transforms.Resize((IMG_RESIZED,IMG_RESIZED)),
+        transforms.CenterCrop((IMG_CROPPED,IMG_CROPPED)),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406),(0.229, 0.224, 0.225))
     ]) 
@@ -516,6 +517,7 @@ if __name__ == "__main__":
         summary_writer = SummaryWriter(log_dir)
         create_folder(log_dir_hp)
         hp_writer = SummaryWriter(log_dir_hp)
+        create_folder('models')
 
     # get diabetic retinopathy dataset
     train_dl_dr, val_dl_dr = get_dataset_dr()
@@ -525,8 +527,8 @@ if __name__ == "__main__":
     x_train, x_meta, y_meta, x_test, y_test = img_paths[idx_train], img_paths[idx_meta], labels_saban[idx_meta], img_paths[idx_test], labels_saban[idx_test]
     y_train = get_dataset_labels(labels_saban[idx_train], labels_berker[idx_train], labels_banu[idx_train], args.labeler)
     train_ds = torch_dataset(x_train, y_train,transform_train)
-    meta_ds  = torch_dataset(x_meta, y_meta,transform_val)
-    test_ds  = torch_dataset(x_test, y_test,transform_val)
+    meta_ds  = torch_dataset(x_meta, y_meta, transform_val)
+    test_ds  = torch_dataset(x_test, y_test, transform_val)
     train_dl = torch.utils.data.DataLoader(train_ds,batch_size=BATCH_SIZE,shuffle=False, num_workers=NUM_WORKERS)
     meta_dl  = torch.utils.data.DataLoader(meta_ds,batch_size=BATCH_SIZE,shuffle=False)
     test_dl  = torch.utils.data.DataLoader(test_ds,batch_size=BATCH_SIZE,shuffle=False)
@@ -541,25 +543,53 @@ if __name__ == "__main__":
     start_train = time.time()
     print("Device: {}/{}, Batch size: {}, Num-MetaData: {}, Seed: {}".format(DEVICE, GPU_ID, BATCH_SIZE, args.metadata_num, RANDOM_SEED))
 
-    model_s1_path = "models1_dr_{}_{}".format(args.stage1,RANDOM_SEED)
-    model_s2_path = "models2_dr_{}_{}_{}".format(args.stage1, args.stage2,RANDOM_SEED)
+    model_s1_path = "models/models1_dr_{}_{}".format(args.stage1,RANDOM_SEED)
+    model_s2_path = "models/models2_dr_{}_{}_{}_{}_{}_{}".format(args.stage1, args.stage2,args.metadata_num,args.testdata_num,args.labeler,RANDOM_SEED)
 
     # pre-train solely on diabetic retinopathy data
-    normal_train(model_s1_path, args.stage1, net, train_dl_dr, val_dl_dr, val_dl_dr)
+    if args.stage1 > 0:
+        if not os.path.exists(model_s1_path):
+            print('Preprocess training on dr dataset...')
+            normal_train(args.stage1, net, train_dl_dr, val_dl_dr, val_dl_dr)
+            torch.save(net.cpu().state_dict(), model_s1_path)
+            net.to(DEVICE) 
+        else:
+            print('Loading preprocessed network on dr dataset...')
+            net.load_state_dict(torch.load(model_s1_path, map_location=DEVICE))  
+            val_accuracy, val_loss = evaluate(net, meta_dl, criterion_cce)
+            test_accuracy, test_loss = evaluate(net, test_dl, criterion_cce)
+            if VERBOSE > 0:
+                print('Pretrained model, Accuracy(val,test): {:3.1f}/{:3.1f}, Loss(val,test): {:4.3f}/{:4.3f}'.format(val_accuracy, test_accuracy,val_loss, test_loss))
+            if SAVE_LOGS == 1:
+                summary_writer.add_scalar('test_loss', test_loss, args.stage1-1)
+                summary_writer.add_scalar('test_accuracy', test_accuracy, args.stage1-1)
+                summary_writer.add_scalar('val_loss', val_loss, args.stage1-1)
+                summary_writer.add_scalar('val_accuracy', val_accuracy, args.stage1-1)
     # change the last layer for rop dataset and freeze last of the layers for learning
     # on rop dataset, we only train fc layers
     net.fc = nn.Linear(2048,NUM_CLASSES) 
     net.to(DEVICE)
-    for param in net.parameters():
-        param.requires_grad = False 
-    for param in net.fc.parameters():
-        param.requires_grad = True
     net.train()
 
     # train solely on rop with noisy labels
     if args.stage2 > 0:
-        model_s2_path = "models2_dr_{}_{}_{}".format(args.stage1, args.stage2,RANDOM_SEED)
-        normal_train(model_s2_path, args.stage2, net, train_dl, meta_dl, test_dl, epoch_offset=args.stage1)
+        if not os.path.exists(model_s2_path):
+            print('Preprocess training on rop dataset...')
+            normal_train(args.stage2, net, train_dl, meta_dl, test_dl, epoch_offset=args.stage1)
+            torch.save(net.cpu().state_dict(), model_s2_path)
+            net.to(DEVICE) 
+        else:
+            print('Loading preprocessed network on rop dataset...')
+            net.load_state_dict(torch.load(model_s2_path, map_location=DEVICE))  
+            val_accuracy, val_loss = evaluate(net, meta_dl, criterion_cce)
+            test_accuracy, test_loss = evaluate(net, test_dl, criterion_cce)
+            if VERBOSE > 0:
+                print('Pretrained model, Accuracy(val,test): {:3.1f}/{:3.1f}, Loss(val,test): {:4.3f}/{:4.3f}'.format(val_accuracy, test_accuracy,val_loss, test_loss))
+            if SAVE_LOGS == 1:
+                summary_writer.add_scalar('test_loss', test_loss, args.stage1-1)
+                summary_writer.add_scalar('test_accuracy', test_accuracy, args.stage1-1)
+                summary_writer.add_scalar('val_loss', val_loss, args.stage1-1)
+                summary_writer.add_scalar('val_accuracy', val_accuracy, args.stage1-1)
     else:
         model_s2_path = model_s1_path
         
