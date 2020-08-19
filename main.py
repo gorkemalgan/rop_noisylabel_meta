@@ -35,6 +35,8 @@ class torch_dataset(Dataset):
 def normal_train(epochs, net, train_dl, val_dl, test_dl, epoch_offset=0):
     NUM_TRAINDATA = len(train_dl.dataset)
     optimizer = optim.SGD(net.parameters(), lr=1e-3, momentum=0.9, weight_decay=1e-4)
+    val_acc_best = 0
+    test_acc_best = 0
     for epoch in range(epochs): 
         start_epoch = time.time()
         train_accuracy = AverageMeter()
@@ -73,6 +75,9 @@ def normal_train(epochs, net, train_dl, val_dl, test_dl, epoch_offset=0):
         # evaluate on validation and test data
         val_accuracy, val_loss = evaluate(net, val_dl, criterion_cce)
         test_accuracy, test_loss = evaluate(net, test_dl, criterion_cce)
+        if val_accuracy > val_acc_best: 
+                val_acc_best = val_accuracy
+                test_acc_best = test_accuracy
 
         if SAVE_LOGS == 1:
             summary_writer.add_scalar('train_loss', train_loss.avg, epoch)
@@ -86,7 +91,8 @@ def normal_train(epochs, net, train_dl, val_dl, test_dl, epoch_offset=0):
             print(template.format(epoch + 1, 
                                 train_accuracy.percentage, val_accuracy, test_accuracy,
                                 train_loss.avg, val_loss, test_loss,  
-                                lr, time.time()-start_epoch, (time.time()-start_epoch)/3600))   
+                                lr, time.time()-start_epoch, (time.time()-start_epoch)/3600)) 
+    return val_accuracy, test_accuracy, val_acc_best, test_acc_best  
 
 def meta_train(alpha, beta, gamma, epochs, net, feature_encoder, train_dl, meta_dl, test_dl, epoch_offset=0):
     print('alpha:{}, beta:{}, gamma:{}, epochs:{}'.format(alpha, beta, gamma, epochs))
@@ -148,7 +154,7 @@ def meta_train(alpha, beta, gamma, epochs, net, feature_encoder, train_dl, meta_
             label_similarity = AverageMeter()
             meta_epoch = epoch
 
-            lr = lr_scheduler(epoch)
+            lr = lr_scheduler(epoch+epoch_offset)
             set_learningrate(optimizer, lr)
             net.train()
             meta_net.train()
@@ -292,9 +298,9 @@ def meta_train(alpha, beta, gamma, epochs, net, feature_encoder, train_dl, meta_
     return meta_training()
 
 def get_model(num_classes):
-    try:
+    if not os.path.exists('resnet50.pt'):
         model = resnet50(pretrained=True)
-    except:
+    else:
         model = resnet50(pretrained=False)
         model.load_state_dict(torch.load('resnet50.pt'))
     model.fc = nn.Linear(2048,num_classes)
@@ -424,7 +430,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('-s', '--batch_size', required=False, type=int, default=32,
+    parser.add_argument('-s', '--batch_size', required=False, type=int, default=16,
         help="Number of gpus to be used")
     parser.add_argument('-i', '--gpu_id', required=False, type=int, default=0,
         help="GPU ids to be used")
@@ -486,6 +492,7 @@ if __name__ == "__main__":
     transform_train = transforms.Compose([
         transforms.Resize((IMG_RESIZED,IMG_RESIZED)),
         transforms.CenterCrop((IMG_CROPPED,IMG_CROPPED)),
+        transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406),(0.229, 0.224, 0.225))
     ]) 
@@ -509,7 +516,7 @@ if __name__ == "__main__":
 
     # if logging
     if SAVE_LOGS == 1:
-        log_folder = args.folder_log if args.folder_log else 'a{}_b{}_g{}_s{}_m{}_{}'.format(args.alpha, args.beta, args.gamma, args.stage1, args.metadata_num, current_time)
+        log_folder = args.folder_log if args.folder_log else 'a{}_b{}_g{}_s1{}_s2{}_s3{}_m{}_t{}_l{}_{}'.format(args.alpha, args.beta, args.gamma, args.stage1, args.stage2, args.stage3, args.metadata_num, args.testdata_num, args.labeler, current_time)
         log_dir = 'logs/{}/'.format(log_folder)
         log_dir_hp = 'logs_hp/{}/'.format(log_folder)
         #clean_emptylogs()
@@ -542,15 +549,18 @@ if __name__ == "__main__":
 
     start_train = time.time()
     print("Device: {}/{}, Batch size: {}, Num-MetaData: {}, Seed: {}".format(DEVICE, GPU_ID, BATCH_SIZE, args.metadata_num, RANDOM_SEED))
+    print('alpha: {}, beta: {}, gamma: {}, stage1: {}, stage2: {}, stage3: {}, metadata-num: {}, testdata-num: {}, labeler: {}, '.format(
+          args.alpha, args.beta, args.gamma, args.stage1, args.stage2, args.stage3, args.metadata_num, args.testdata_num, args.labeler))
 
-    model_s1_path = "models/models1_dr_{}_{}".format(args.stage1,RANDOM_SEED)
-    model_s2_path = "models/models2_dr_{}_{}_{}_{}_{}_{}".format(args.stage1, args.stage2,args.metadata_num,args.testdata_num,args.labeler,RANDOM_SEED)
+    model_s1_path = "models/models1_dr_{}_{}".format(args.stage1, RANDOM_SEED)
+    model_s2_path = "models/models2_dr_{}_{}_{}_{}_{}_{}".format(args.stage1, args.stage2, args.metadata_num, args.testdata_num, args.labeler, RANDOM_SEED)
 
     # pre-train solely on diabetic retinopathy data
     if args.stage1 > 0:
         if not os.path.exists(model_s1_path):
-            print('Preprocess training on dr dataset...')
-            normal_train(args.stage1, net, train_dl_dr, val_dl_dr, val_dl_dr)
+            print('Preprocess training on DR dataset...')
+            val_accuracy, test_accuracy, val_acc_best, test_acc_best = normal_train(args.stage1, net, train_dl_dr, val_dl_dr, val_dl_dr)
+            print('Trained model on DR, Accuracy(val,test): {:3.1f}/{:3.1f}, Accuracy-best(val,test): {:3.1f}/{:3.1f}'.format(val_accuracy, test_accuracy, val_acc_best, test_acc_best))
             torch.save(net.cpu().state_dict(), model_s1_path)
             net.to(DEVICE) 
         else:
@@ -558,8 +568,7 @@ if __name__ == "__main__":
             net.load_state_dict(torch.load(model_s1_path, map_location=DEVICE))  
             val_accuracy, val_loss = evaluate(net, meta_dl, criterion_cce)
             test_accuracy, test_loss = evaluate(net, test_dl, criterion_cce)
-            if VERBOSE > 0:
-                print('Pretrained model, Accuracy(val,test): {:3.1f}/{:3.1f}, Loss(val,test): {:4.3f}/{:4.3f}'.format(val_accuracy, test_accuracy,val_loss, test_loss))
+            print('Pretrained model on DR, Accuracy(val,test): {:3.1f}/{:3.1f}, Loss(val,test): {:4.3f}/{:4.3f}'.format(val_accuracy, test_accuracy,val_loss, test_loss))
             if SAVE_LOGS == 1:
                 summary_writer.add_scalar('test_loss', test_loss, args.stage1-1)
                 summary_writer.add_scalar('test_accuracy', test_accuracy, args.stage1-1)
@@ -572,26 +581,23 @@ if __name__ == "__main__":
     net.train()
 
     # train solely on rop with noisy labels
-    if args.stage2 > 0:
-        if not os.path.exists(model_s2_path):
-            print('Preprocess training on rop dataset...')
-            normal_train(args.stage2, net, train_dl, meta_dl, test_dl, epoch_offset=args.stage1)
-            torch.save(net.cpu().state_dict(), model_s2_path)
-            net.to(DEVICE) 
-        else:
-            print('Loading preprocessed network on rop dataset...')
-            net.load_state_dict(torch.load(model_s2_path, map_location=DEVICE))  
-            val_accuracy, val_loss = evaluate(net, meta_dl, criterion_cce)
-            test_accuracy, test_loss = evaluate(net, test_dl, criterion_cce)
-            if VERBOSE > 0:
-                print('Pretrained model, Accuracy(val,test): {:3.1f}/{:3.1f}, Loss(val,test): {:4.3f}/{:4.3f}'.format(val_accuracy, test_accuracy,val_loss, test_loss))
-            if SAVE_LOGS == 1:
-                summary_writer.add_scalar('test_loss', test_loss, args.stage1-1)
-                summary_writer.add_scalar('test_accuracy', test_accuracy, args.stage1-1)
-                summary_writer.add_scalar('val_loss', val_loss, args.stage1-1)
-                summary_writer.add_scalar('val_accuracy', val_accuracy, args.stage1-1)
+    if not os.path.exists(model_s2_path):
+        print('Preprocess training on ROP dataset...')
+        val_accuracy, test_accuracy, val_acc_best, test_acc_best = normal_train(args.stage2, net, train_dl, meta_dl, test_dl, epoch_offset=args.stage1)
+        print('Trained model on ROP, Accuracy(val,test): {:3.1f}/{:3.1f}, Accuracy-best(val,test): {:3.1f}/{:3.1f}'.format(val_accuracy, test_accuracy, val_acc_best, test_acc_best))
+        torch.save(net.cpu().state_dict(), model_s2_path)
+        net.to(DEVICE) 
     else:
-        model_s2_path = model_s1_path
+        print('Loading preprocessed network on ROP dataset...')
+        net.load_state_dict(torch.load(model_s2_path, map_location=DEVICE))  
+        val_accuracy, val_loss = evaluate(net, meta_dl, criterion_cce)
+        test_accuracy, test_loss = evaluate(net, test_dl, criterion_cce)
+        print('Pretrained model on ROP, Accuracy(val,test): {:3.1f}/{:3.1f}, Loss(val,test): {:4.3f}/{:4.3f}'.format(val_accuracy, test_accuracy,val_loss, test_loss))
+        if SAVE_LOGS == 1:
+            summary_writer.add_scalar('test_loss', test_loss, args.stage1-1)
+            summary_writer.add_scalar('test_accuracy', test_accuracy, args.stage1-1)
+            summary_writer.add_scalar('val_loss', val_loss, args.stage1-1)
+            summary_writer.add_scalar('val_accuracy', val_accuracy, args.stage1-1)
         
     # meta-train
     feature_encoder.load_state_dict(torch.load(model_s2_path, map_location=DEVICE))  
@@ -601,7 +607,7 @@ if __name__ == "__main__":
     if SAVE_LOGS:
         NUM_TRAINDATA = len(train_dl.dataset)
         # write log for hyperparameters
-        hp_writer.add_hparams({'alpha':args.alpha, 'beta': args.beta, 'gamma':args.gamma, 'stage1':args.stage1, 'stage2':args.stage2, 'stage2':args.stage3, 'num_meta':args.metadata_num, 'num_train': NUM_TRAINDATA}, 
-                                {'val_accuracy': val_acc_best, 'test_accuracy': test_acc_best, 'epoch_best':epoch_best})
+        hp_writer.add_hparams({'alpha':args.alpha, 'beta': args.beta, 'gamma':args.gamma, 'stage1':args.stage1, 'stage2':args.stage2, 'stage2':args.stage3, 'num_meta':args.metadata_num, 'num_testdata':args.testdata_num, 'labeler':args.labeler}, 
+                              {'val_accuracy': val_acc_best, 'test_accuracy': test_acc_best, 'epoch_best':epoch_best})
         hp_writer.close()
     print('Total training duration: {:3.2f}h'.format((time.time()-start_train)/3600))
