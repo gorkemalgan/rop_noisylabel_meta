@@ -1,8 +1,7 @@
 data/
 logs/
 logs_hp/
-models/
 
 *.json
 *.pyc
-*.pt
+*.sh

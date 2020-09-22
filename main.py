@@ -273,16 +273,17 @@ def meta_train(alpha, beta, gamma, epochs, net, feature_encoder, train_dl, meta_
     class MetaNet(nn.Module):
         def __init__(self, input, output):
             super(MetaNet, self).__init__()
-            layer1_size = input
-            layer2_size = int(input/2)
-            self.linear1 = nn.Linear(layer1_size, layer1_size)
-            self.linear2 = nn.Linear(layer1_size, layer2_size)
-            self.linear3 = nn.Linear(layer2_size, output)
-            self.bn1 = nn.BatchNorm1d(layer1_size)
-            self.bn2 = nn.BatchNorm1d(layer2_size)
+            #layer1_size = input
+            #layer2_size = int(input/2)
+            #self.linear1 = nn.Linear(layer1_size, layer1_size)
+            #self.linear2 = nn.Linear(layer1_size, layer2_size)
+            #self.linear3 = nn.Linear(layer2_size, output)
+            #self.bn1 = nn.BatchNorm1d(layer1_size)
+            #self.bn2 = nn.BatchNorm1d(layer2_size)
+            self.linear3 = nn.Linear(input, output)
         def forward(self, x):
-            x = F.relu(self.bn1(self.linear1(x)))
-            x = F.relu(self.bn2(self.linear2(x)))
+            #x = F.relu(self.bn1(self.linear1(x)))
+            #x = F.relu(self.bn2(self.linear2(x)))
             out = self.linear3(x)
             return softmax(out)
     meta_net = MetaNet(NUM_FEATURES, NUM_CLASSES).to(DEVICE)
@@ -293,6 +294,156 @@ def meta_train(alpha, beta, gamma, epochs, net, feature_encoder, train_dl, meta_
     new_y = init_labels()
     # extract features for all training data
     features, _, _ = extract_features() 
+
+    # meta training
+    return meta_training()
+
+def mslg(alpha, beta, gamma, epochs, net, train_dl, meta_dl, test_dl, epoch_offset=0):
+    print('alpha:{}, beta:{}, gamma:{}, epochs:{}'.format(alpha, beta, gamma, epochs))
+
+    NUM_TRAINDATA = len(train_dl.dataset)
+    optimizer = optim.SGD(net.parameters(), lr=1e-3, momentum=0.9, weight_decay=1e-4)
+
+    def meta_training_loop(meta_epoch, index, output, yy, images_meta, labels_meta):
+        # meta training for predicted labels
+        y_softmaxed = softmax(yy)
+        lc = criterion_meta(output, y_softmaxed)                                            # classification loss
+        # train for classification loss with meta-learning
+        net.zero_grad()
+        grads = torch.autograd.grad(lc, net.parameters(), create_graph=True, retain_graph=True, only_inputs=True)
+        for grad in grads:
+            grad.detach()
+        fast_weights = OrderedDict((name, param - alpha*grad) for ((name, param), grad) in zip(net.named_parameters(), grads))  
+        fast_out = net.forward(images_meta,fast_weights)   
+        loss_meta = criterion_cce(fast_out, labels_meta)
+        grads_yy = torch.autograd.grad(loss_meta, yy, create_graph=False, retain_graph=True, only_inputs=True)
+        for grad in grads_yy:
+            grad.detach()
+        meta_grads = beta*grads_yy[0]
+        # update labels
+        yy.data.sub_(meta_grads)
+        new_y[meta_epoch+1,index,:] = yy.data.cpu().numpy()
+        del grads, grads_yy
+
+        # training base network
+        y_softmaxed = softmax(yy)
+        lc = criterion_meta(output, y_softmaxed)                        # classification loss
+        le = -torch.mean(torch.mul(softmax(output), logsoftmax(output)))# entropy loss
+        loss = lc + gamma*le                                            # overall loss
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        return loss
+
+    def meta_training():
+        # initialize parameters and buffers
+        t_meta_loader_iter = iter(meta_dl) 
+        labels_yy = np.zeros(NUM_TRAINDATA)
+        test_acc_best = 0
+        val_acc_best = 0
+        epoch_best = 0
+        for epoch in range(epochs): 
+            start_epoch = time.time()
+            train_accuracy = AverageMeter()
+            train_loss = AverageMeter()
+            train_accuracy_meta = AverageMeter()
+            label_similarity = AverageMeter()
+            meta_epoch = epoch
+
+            lr = lr_scheduler(epoch+epoch_offset)
+            set_learningrate(optimizer, lr)
+            net.train()
+            y_hat = new_y[meta_epoch+1,:,:].copy()
+
+            for batch_idx, (images, labels) in enumerate(train_dl):
+                start = time.time()
+                index = np.arange(batch_idx*BATCH_SIZE, (batch_idx)*BATCH_SIZE+labels.size(0))
+                
+                # training images and labels
+                images, labels = images.to(DEVICE), labels.to(DEVICE)
+                images, labels = torch.autograd.Variable(images), torch.autograd.Variable(labels)
+
+                # compute output
+                output, _ = net(images,get_feat=True)
+                _, predicted = torch.max(output.data, 1)
+
+                # predict labels
+                yy = torch.FloatTensor(y_hat[index,:]).to(DEVICE)
+                yy = torch.autograd.Variable(yy,requires_grad = True)
+                _, labels_yy[index] = torch.max(yy.cpu(), 1)
+                # meta training images and labels
+                try:
+                    images_meta, labels_meta = next(t_meta_loader_iter)
+                except StopIteration:
+                    t_meta_loader_iter = iter(meta_dl)
+                    images_meta, labels_meta = next(t_meta_loader_iter)
+                    images_meta, labels_meta = images_meta[:labels.size(0)], labels_meta[:labels.size(0)]
+                images_meta, labels_meta = images_meta.to(DEVICE), labels_meta.to(DEVICE)
+                images_meta, labels_meta = torch.autograd.Variable(images_meta), torch.autograd.Variable(labels_meta)
+                
+                #with torch.autograd.detect_anomaly():
+                loss = meta_training_loop(meta_epoch, index, output, yy, images_meta, labels_meta)
+
+                train_accuracy.update(predicted.eq(labels.data).cpu().sum().item(), labels.size(0)) 
+                train_loss.update(loss.item())
+                train_accuracy_meta.update(predicted.eq(torch.tensor(labels_yy[index]).to(DEVICE)).cpu().sum().item(), predicted.size(0)) 
+                label_similarity.update(labels.eq(torch.tensor(labels_yy[index]).to(DEVICE)).cpu().sum().item(), labels.size(0))
+
+                if VERBOSE == 2:
+                    template = "Progress: {:6.5f}, Accuracy: {:5.4f}, Accuracy Meta: {:5.4f}, Loss: {:5.4f}, Process time:{:5.4f}   \r"
+                    sys.stdout.write(template.format(batch_idx*BATCH_SIZE/NUM_TRAINDATA, train_accuracy.percentage, train_accuracy_meta.percentage, train_loss.avg, time.time()-start))
+            if VERBOSE == 2:
+                sys.stdout.flush()           
+
+            if SAVE_LOGS == 1:
+                np.save(log_dir + "y.npy", new_y)
+            # evaluate on validation and test data
+            val_accuracy, val_loss = evaluate(net, meta_dl, criterion_cce)
+            test_accuracy, test_loss = evaluate(net, test_dl, criterion_cce)
+            if val_accuracy > val_acc_best: 
+                val_acc_best = val_accuracy
+                test_acc_best = test_accuracy
+                epoch_best = epoch
+
+            if SAVE_LOGS == 1:
+                summary_writer.add_scalar('train_loss', train_loss.avg, epoch+epoch_offset)
+                summary_writer.add_scalar('test_loss', test_loss, epoch+epoch_offset)
+                summary_writer.add_scalar('train_accuracy', train_accuracy.percentage, epoch+epoch_offset)
+                summary_writer.add_scalar('test_accuracy', test_accuracy, epoch+epoch_offset)
+                summary_writer.add_scalar('test_accuracy_best', test_acc_best, epoch+epoch_offset)
+                summary_writer.add_scalar('val_loss', val_loss, epoch+epoch_offset)
+                summary_writer.add_scalar('val_accuracy', val_accuracy, epoch+epoch_offset)
+                summary_writer.add_scalar('val_accuracy_best', val_acc_best, epoch+epoch_offset)
+                summary_writer.add_scalar('label_similarity', label_similarity.percentage, epoch+epoch_offset)
+
+            if VERBOSE > 0:
+                template = 'Epoch {}, Accuracy(train,meta_train,val,test): {:3.1f}/{:3.1f}/{:3.1f}/{:3.1f}, Loss(train,val,test): {:4.3f}/{:4.3f}/{:4.3f}, Label similarity: {:6.3f}, Hyper-params(alpha,beta,gamma): {:3.2f}/{:5.4f}/{:3.2f}, Time: {:3.1f}({:3.2f})'
+                print(template.format(epoch + 1, 
+                                    train_accuracy.percentage, train_accuracy_meta.percentage, val_accuracy, test_accuracy,
+                                    train_loss.avg, val_loss, test_loss,  
+                                    label_similarity.percentage, alpha, beta, gamma,
+                                    time.time()-start_epoch, (time.time()-start_epoch)/3600))
+
+        print('Train acc: {:3.1f}, Validation acc: {:3.1f}-{:3.1f}, Test acc: {:3.1f}-{:3.1f}, Best epoch: {}, Num meta-data: {},Hyper-params(alpha,beta,gamma): {:3.2f}/{:5.4f}/{:3.2f}'.format(
+            train_accuracy.percentage, val_accuracy, val_acc_best, test_accuracy, test_acc_best, epoch_best, args.metadata_num, alpha, beta, gamma))
+        if SAVE_LOGS == 1:
+            summary_writer.close()
+            torch.save(net.state_dict(), os.path.join(log_dir, 'saved_model.pt'))
+        return val_acc_best, test_acc_best, epoch_best
+
+    def init_labels():
+        new_y = np.zeros([NUM_META_EPOCHS+1,NUM_TRAINDATA,NUM_CLASSES])
+        y_init = np.zeros([NUM_TRAINDATA,NUM_CLASSES])
+        for batch_idx, (_, labels) in enumerate(train_dl):
+            index = np.arange(batch_idx*BATCH_SIZE, (batch_idx)*BATCH_SIZE+labels.size(0))
+            onehot = torch.zeros(labels.size(0), NUM_CLASSES).scatter_(1, labels.view(-1, 1), 10).cpu().numpy()
+            y_init[index, :] = onehot
+        new_y[0] = y_init
+        return new_y
+
+    # initialize predicted labels with given labels
+    new_y = init_labels()
 
     # meta training
     return meta_training()
@@ -455,14 +606,14 @@ if __name__ == "__main__":
         help="Gamma paramter")
     parser.add_argument('-s1', '--stage1', required=False, type=int, default=1,
         help="Epoch num to end stage1 (straight training)")
-    parser.add_argument('-s2', '--stage2', required=False, type=int, default=1,
+    parser.add_argument('-s2', '--stage2', required=False, type=int, default=10,
         help="Epoch num to end stage2 (meta training)")
     parser.add_argument('-s3', '--stage3', required=False, type=int, default=10,
         help="")
 
     parser.add_argument('-m', '--metadata_num', required=False, type=int, default=200,
         help="Number of samples to be used as meta-data")
-    parser.add_argument('-t', '--testdata_num', required=False, type=int, default=200,
+    parser.add_argument('-t', '--testdata_num', required=False, type=int, default=300,
         help="Number of samples to be used as meta-data")
     parser.add_argument('-l', '--labeler', required=False, type=str, default='mv',
         help="saban, berker, banu, mv, soft")
@@ -548,9 +699,9 @@ if __name__ == "__main__":
         print('All different: {}'.format(np.sum(np.bitwise_and(labels_saban[labels_berker != labels_banu] != labels_berker[labels_berker != labels_banu], labels_saban[labels_berker != labels_banu] != labels_banu[labels_berker != labels_banu]))))
 
     start_train = time.time()
-    print("Device: {}/{}, Batch size: {}, Num-MetaData: {}, Seed: {}".format(DEVICE, GPU_ID, BATCH_SIZE, args.metadata_num, RANDOM_SEED))
-    print('alpha: {}, beta: {}, gamma: {}, stage1: {}, stage2: {}, stage3: {}, metadata-num: {}, testdata-num: {}, labeler: {}, '.format(
-          args.alpha, args.beta, args.gamma, args.stage1, args.stage2, args.stage3, args.metadata_num, args.testdata_num, args.labeler))
+    print("Device: {}/{}, Batch size: {}, Num-Data(train,meta,test): {}/{}/{}, Seed: {}".format(DEVICE, GPU_ID, BATCH_SIZE, len(train_ds), len(meta_ds), len(test_ds), RANDOM_SEED))
+    print('alpha: {}, beta: {}, gamma: {}, stage1: {}, stage2: {}, stage3: {}, labeler: {}, '.format(
+          args.alpha, args.beta, args.gamma, args.stage1, args.stage2, args.stage3, args.labeler))
 
     model_s1_path = "models/models1_dr_{}_{}".format(args.stage1, RANDOM_SEED)
     model_s2_path = "models/models2_dr_{}_{}_{}_{}_{}_{}".format(args.stage1, args.stage2, args.metadata_num, args.testdata_num, args.labeler, RANDOM_SEED)
@@ -603,6 +754,7 @@ if __name__ == "__main__":
     feature_encoder.load_state_dict(torch.load(model_s2_path, map_location=DEVICE))  
     feature_encoder.eval()
     val_acc_best, test_acc_best, epoch_best = meta_train(args.alpha, args.beta, args.gamma, args.stage3, net, feature_encoder, train_dl, meta_dl, test_dl, epoch_offset=args.stage1+args.stage2)
+    #val_acc_best, test_acc_best, epoch_best = mslg(args.alpha, args.beta, args.gamma, args.stage3, net, train_dl, meta_dl, test_dl, epoch_offset=args.stage1+args.stage2)
 
     if SAVE_LOGS:
         NUM_TRAINDATA = len(train_dl.dataset)
